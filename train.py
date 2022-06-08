@@ -1,12 +1,13 @@
 import torch.optim as optim
 import torch
 from dataloader import *
-from vit_dis import vit_discriminator
+from newvit import vit_discriminator
 from fine_gen import fine_generator
 from coarse_gen import coarse_generator
-from loss_torch import ef_loss,categorical_crossentropy,PerceptualLoss
+from loss_torch import ef_loss,categorical_crossentropy,PerceptualLoss,Hinge_Loss
 import matplotlib.pyplot as plt
 import random
+from torchvision import transforms
 
 device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 nlr=0.0002
@@ -30,16 +31,19 @@ optimizerG_c = optim.Adam(coarse_generator.parameters(), lr=nlr, betas=(nbeta1, 
 
 MSELoss=torch.nn.MSELoss()
 perceptual_loss = PerceptualLoss(torch.nn.MSELoss())
+Hinge_Loss=Hinge_Loss().cuda()
+BCELoss=torch.nn.BCELoss()
+L1loss=torch.nn.L1Loss()
 
 # generate a batch of fake samples for Coarse Generator
 #generatelabel
 epoches=100
 
-label_true= torch.ones(1,1,64,64).cuda()
-label_false=torch.zeros(1,1,64,64).cuda()
+label_true= torch.ones(1,1,64,64).to(device)
+label_false=-1*torch.ones(1,1,64,64).to(device)
 
-nor_label=[0,1]
-ab_label=[1,0]
+nor_label=[0,0.9]
+ab_label=[0.9,0]
 
 Dloss1=[]
 Dloss2=[]
@@ -91,38 +95,40 @@ for epoch in range(epoches):
         ## FINE DISCRIMINATOR
         # update discriminator for real samples
         optimizerD_f.zero_grad()
-        fine_real_hinge, fine_real_class, fine_real_feat=fine_discriminator(fundus,angio)
-        MSE_loss1=MSELoss(fine_real_hinge,label_true)
+        fine_real_hinge, fine_real_class, fine_real_feat=fine_discriminator(fundus,angio,patch_size=64)
+        print(fine_real_hinge.shape)
         ca_loss1=categorical_crossentropy(label,fine_real_class)
-        dloss1=MSE_loss1+10*ca_loss1
+        hinge_loss1=Hinge_Loss(fine_real_hinge,label_true)
+        dloss1=10*hinge_loss1+10*ca_loss1
         dloss1.backward()
         optimizerD_f.step()
 
         # update discriminator for generated samples
-        fine_fake_hinge, fine_fake_class, fine_fake_feat=fine_discriminator(fundus,fine_image.detach())
-        MSE_loss2=MSELoss(fine_fake_hinge,label_false)
+        fine_fake_hinge, fine_fake_class, fine_fake_feat=fine_discriminator(fundus,fine_image.detach(),patch_size=64)
+        #MSE_loss2=MSELoss(fine_fake_hinge,label_false)
+        hinge_loss2 = Hinge_Loss(fine_fake_hinge,label_false)
         ef_loss1=ef_loss(fine_fake_feat,fine_real_feat.detach())
         ca_loss2=categorical_crossentropy(label,fine_fake_class)
-        dloss2=MSE_loss2+10*ca_loss2+10*ef_loss1
+        dloss2=10*hinge_loss2+10*ca_loss2+ef_loss1
         dloss2.backward()
         optimizerD_f.step()
 
         ## COARSE DISCRIMINATOR
         # update discriminator for real samples#定义了两个判别器
         optimizerD_c.zero_grad()
-        coarse_real_hinge, coarse_real_class, coarse_real_feat=coarse_discriminator(fundus_resize,angio_resize)
-        MSE_loss3=MSELoss(coarse_real_hinge,label_true)
+        coarse_real_hinge, coarse_real_class, coarse_real_feat=coarse_discriminator(fundus_resize,angio_resize,patch_size=32)
+        hinge_loss3=Hinge_Loss(coarse_real_hinge,label_true)
         ca_loss3=categorical_crossentropy(label,coarse_real_class)
-        dloss3=MSE_loss3+10*ca_loss3
+        dloss3=10*hinge_loss3+10*ca_loss3
         dloss3.backward()
         optimizerD_c.step()
 
         # update discriminator for generated samples
-        coarse_fake_hinge, coarse_fake_class, coarse_fake_feat=coarse_discriminator(fundus_resize,coarse_image.detach())
-        MSE_loss4 = MSELoss(coarse_fake_hinge,label_false)
+        coarse_fake_hinge, coarse_fake_class, coarse_fake_feat=coarse_discriminator(fundus_resize,coarse_image.detach(),patch_size=32)
         ef_loss2 = ef_loss(coarse_fake_feat,coarse_real_feat.detach())
         ca_loss4 = categorical_crossentropy(label,coarse_fake_class)
-        dloss4 = MSE_loss4+10*ef_loss2+10*ca_loss4
+        hinge_loss4 = Hinge_Loss(coarse_fake_hinge,label_false)
+        dloss4 = 10*hinge_loss4+10*ca_loss4+ef_loss2
         dloss4.backward()
         optimizerD_c.step()
 
@@ -134,11 +140,16 @@ for epoch in range(epoches):
 
     optimizerG_c.zero_grad()
     coarse_image_resize, feature_out=coarse_generator(fundus_resize)
+
+    g_vit1,_,_=coarse_discriminator(fundus_resize,coarse_image_resize,patch_size=32)
     MSE_loss5=MSELoss(coarse_image_resize,angio_resize)
     coarse_Perceptual=torch.concat([coarse_image_resize,coarse_image_resize,coarse_image_resize],1)
     angio_resize_Perceptual=torch.concat([angio_resize,angio_resize,angio_resize],1)
     loss_Perceptual1 = perceptual_loss.get_loss(coarse_Perceptual,angio_resize_Perceptual)
-    gloss1=10*MSE_loss5+10*loss_Perceptual1
+    #gloss_hinge1=Hinge_Loss(g_vit1,label_true)
+    gl1=L1loss(g_vit1,label_true)
+    gloss1=10*MSE_loss5+10*loss_Perceptual1+10*gl1
+           #+10*gloss_hinge1
     Gloss1.append(gloss1)
     gloss1.backward()
     optimizerG_c.step()
@@ -146,11 +157,15 @@ for epoch in range(epoches):
     # update the Fine generator
     optimizerG_f.zero_grad()
     fine_image=fine_generator(fundus,feature_out.detach())
+    g_vit2,_,_=fine_discriminator(fine_image)
     MSE_loss6=MSELoss(fine_image,angio)
     fine_Perceptual=torch.concat([fine_image,fine_image,fine_image],1)
     angio_Perceptual=torch.concat([angio,angio,angio],1)
     loss_Perceptual2 = perceptual_loss.get_loss(fine_Perceptual,angio_Perceptual)
-    gloss2=10*MSE_loss6+10*loss_Perceptual2
+    #gloss_hinge2=Hinge_Loss(g_vit2,label_true)
+    gl2=BCELoss(g_vit2,label_true)
+    gloss2=10*MSE_loss6+10*loss_Perceptual2+10*gl2
+           #+10*gloss_hinge2
     Gloss2.append(gloss2)
     gloss2.backward()
     optimizerG_f.step()
